@@ -69,6 +69,65 @@ class RescaleSegmentor:
         _scores = tf.image.resize(_scores, 
                                   size = self.target_size, 
                                   method = tf.image.ResizeMethod.BILINEAR)
+        _scores = tf.squeeze(_scores, axis = 1)
+        patch_scores = _scores.numpy()
 
+        if isinstance(features, np.ndarray):
+            features = tf.convert_to_tensor(features)
+        features = tf.identity(features)
+        features = tf.transpose(features, perm=([0,3,1,2]))
+        if self.target_size[0] * self.target_size[1] * features.shape[0] * features.shape[1] >= 2**31:
+            subbatch_size = int((2**31-1) / (self.target_size[0] * self.target_size[1] * features.shape[1]))
+            interpolated_features = []
+            for i_subbatch in range(int(features.shape[0] / subbatch_size + 1)):
+                subfeatures = features[i_subbatch*subbatch_size:(i_subbatch+1)*subbatch_size]
+                subfeatures = subfeatures.unsuqeeze(0) if len(subfeatures.shape) == 3 else subfeatures
+                subfeatures = tf.image.resize(subfeatures, size = self.target_size, method=tf.image.ResizeMethod.BILINEAR)
+                interpolated_features.append(subfeatures)
+            features = tf.concat(interpolated_features, axis = 0)
+        else:
+            features = tf.image.resize(features, size = self.target_size, method = tf.image.ResizeMethod.BILINEAR)
+        features = features.numpy()
 
+        return [
+        ndimage.gaussian_filter(patch_score, sigma=self.smoothing) for patch_score in patch_scores
+        ], [feature for feature in features]
+    
 
+class NetworkFeatureAggregator(tf.keras.Model):
+    def __init__(self, backbone, layers_to_extract_from, train_backbone = False):
+        self.layers_to_extract_from = layers_to_extract_from
+        self.backbone = backbone
+        self.train_backbone = train_backbone
+        self.outputs = {}
+
+        self.hook_handles = []
+        for extract_layer in layers_to_extract_from:
+            forward_hook = ForwardHook(
+                self.outputs, extract_layer, layers_to_extract_from[-1]
+            )
+            if '.' in extract_layer:
+                extract_block, extract_idx = extract_layer.split('.')
+                network_layer = backbone.get_layer(extract_block)
+                if extract_idx.isnumeric():
+                    extract_idx = int(extract_idx)
+                    network_layer = network_layer.get_layer(extract_idx)
+                else:
+                    network_layer = network_layer.get_layer(extract_idx)
+            else:
+                network_layer = backbone.get_layer(extract_layer)
+            if isinstance(network_layer, tf.keras.Sequential):
+                self.hook_handles.append(
+                    network_layer.layers[-1].register_forward_hook(forward_hook)
+                )
+
+class ForwardHook:
+    def __init__(self, hook_dict, layer_name: str, last_layer_to_extract: str):
+        self.hook_dict = hook_dict
+        self.layer_name = layer_name
+        self.raise_excepttion_to_break = copy.deepcopy(
+            layer_name == last_layer_to_extract
+        )
+    def __call__(self, module, input, output):
+        self.hook_dict[self.layer_name] = output
+        return None
