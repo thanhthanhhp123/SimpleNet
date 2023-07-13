@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import tqdm
+import torch.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import common
 import metrics
@@ -201,3 +202,124 @@ class SimpleNet(nn.Module):
                         features.append(self._embed(input_image))
                 return features
             return self._embed(data)
+        
+        def _embed(self, images, detach=True, provide_patch_shapes = False, evaluation = False):
+            B = len(images)
+            if not evaluation and self.train_backbone:
+                self.forward_modules['feature_aggerator'](images, eval = evaluation)
+                features = self.forward_modules['feature_aggregator'].train()
+            else:
+                _ = self.forward_modules['feature_aggregator'].eval()
+                with torch.no_grad():
+                    features = self.forward_modules['feature_aggregator'](images)
+            
+            features = [features[layer] for layer in self.layers_to_extract_from]
+
+            for i, feat in enumerate(features):
+                if len(feat.shape) == 3:
+                    B, L, C = feat.shape
+                    features[i] = feat.reshape(B, int(math.sqrt(L)), int(math.sqrt(L)), C).permute(0, 3, 1, 2)
+            
+            features = [
+                self.patch_maker.patchify(x,
+                                          return_spatial_infor=True) for x in features
+            ]
+            patch_shapes = [x[1] for x in features]
+            features = [x[0] for x in features]
+            ref_num_patches = patch_shapes[0]
+
+            for i in range(1, len(features)):
+                _features = features[i]
+                patch_dims = patch_shapes[i]
+
+                _features = _features.permute(0, -3, -2, -1, 1, 2)
+                perm_base_shape = _features.shape
+                _features = _features.reshape(
+                    -1, *_features.shape[-2:]
+                )
+                _features = F.interpolate(
+                    _features.unsqueeze(1),
+                    size = (ref_num_patches[0], ref_num_patches[1]),
+                    mode = 'bilinear',
+                    align_corners = False
+                )
+                _features = _features.squeeze(1)
+                _features = _features.reshape(
+                    *perm_base_shape[:-2], ref_num_patches[0], ref_num_patches[1]
+                )
+                _features = _features.permute(0, -2, -1, 1, 2, 3)
+                _features = _features.reshape(
+                    len(_features), -1, *_features.shape[-3:]
+                )
+                features[i] = _features
+            features = [x.reshape(-1, *x.shape[-3:]) for x in features]
+
+            features = self.forward_modules['preprocessing'](features)
+            features = self.forward_modules['preadapt_aggretor'](features)
+
+            return features, patch_shapes
+    
+    def test(self, training_data, test_data):
+        ckpt_path = os.path.join(self.ckpt_dir, 'models.ckpt')
+        if os.path.exists(ckpt_path):
+            state_dicts = torch.load(ckpt_path)
+            if 'pretrained_enc' in state_dicts:
+                self.features_enc.load_state_dict(state_dicts['pretrained_enc'])
+            if 'pretrained_dec' in state_dicts:
+                self.features_dec.load_state_dict(state_dicts['pretrained_dec'])
+        aggerator = {'scores': [],
+                     'segmentations': [],
+                     'features': []}
+        scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
+        aggerator['scores'].append(scores)
+        aggerator['segmentations'].append(segmentations)
+        aggerator['features'].append(features)
+
+        scores = np.array(aggerator['scores'])
+        min_scores = scores.min(axis=-1).reshape(-1, 1)
+        max_scores = scores.max(axis=-1).reshape(-1, 1)
+        scores = (scores - min_scores) / (max_scores - min_scores)
+        scroes = np.mean(scores, axis=0)
+
+        segmentations = np.array(aggerator['segmentations'])
+        min_scores = (
+            segmentations.reshape(
+            len(segmentations), -1
+            ).min(axis = -1).reshape(-1, 1, 1, 1)
+        )
+        max_scores = (
+            segmentations.reshape(
+            len(segmentations), -1
+            ).max(axis = -1).reshape(-1, 1, 1, 1)
+        )
+        segmentations = (segmentations - min_scores) / (max_scores - min_scores)
+        segmentations = np.mean(segmentations, axis=0)
+
+        anomaly_labels = [
+            x[1] != 'good' for x in test_data.dataset.data_to_iterate
+        ]
+
+        auroc = metrics.compute_imagewise_retrieval_metrics(
+            scores, anomaly_labels
+        )['auroc']
+
+        pixel_scores = metrics.compute_imagewise_retrieval_metrics(
+            segmentations, masks_gt
+        )
+
+        full_pixel_auroc = pixel_scores['auroc']
+
+        return auroc, full_pixel_auroc
+    
+    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt):
+        scores = np.squeeze(np.array(scores))
+        img_min_scores = scores.min(axis=-1)
+        img_max_scores = scores.max(axis=-1)
+        scores = (scores - img_min_scores) / (img_max_scores - img_min_scores)
+
+        auroc = metrics.compute_imagewise_retrieval_metrics(
+            scores, labels_gt
+        )['auroc']
+
+        if len(masks_gt) > 0:
+            pass
