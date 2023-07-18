@@ -451,3 +451,38 @@ class SimpleNet(nn.Module):
                     self.logger.step()
 
                     loss.backward()
+                    if self.pre_proj > 0:
+                        self.proj_opt.step()
+                    if self.train_backbone:
+                        self.backbone_opt.step()
+                    self.dsc_opt.step()
+
+                    loss = loss.detach().cpu()
+                    all_loss.append(loss.item())
+                    all_p_true.append(p_true.cpu().item())
+                    all_p_fake.append(p_fake.cpu().item())
+                
+                if len(embeddings_list) > 0:
+                    self.auto_noise[1] = torch.cat(embeddings_list).std(0).mean(-1)
+
+                if self.cos_lr:
+                    self.dsc_schl.step()
+                
+
+                all_loss = sum(all_loss) / len(input_data)
+                all_p_fake = sum(all_p_fake) / len(input_data)
+                all_p_true = sum(all_p_true) / len(input_data)
+                cur_lr = self.dsc_opt.state_dict()['params_groups'][0]['lr']
+                pbar_str = f'epoch:{i_epoch} loss:{round(all_loss, 5)}'
+                pbar_str += f'lr:{round(cur_lr, 6)}'
+                pbar_str += f'p_true: {round(all_p_true, 3)} p_fake:{round(all_p_fake, 3)}'
+                if len(all_p_interp) > 0:
+                    pbar_str += f'p_interp:{round(sum(all_p_interp) / len(input_data), 3)}'
+                pbar.set_description(pbar_str)
+                pbar.update(1)
+    def predict(self, data, prefix = ''):
+        if isinstance(data, torch.utils.data.DataLoader):
+            return self._predict_dataloader(data, prefix)
+        return self._predict(data)
+    def _predict_dataloader(self, data_loader, prefix):
+        pass
