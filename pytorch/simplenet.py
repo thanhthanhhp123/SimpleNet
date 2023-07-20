@@ -12,6 +12,7 @@ import torch.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import common
 import metrics
+from sklearn.manifold import TSNE
 
 LOGGER = logging.getLogger(__name__)
 
@@ -484,5 +485,132 @@ class SimpleNet(nn.Module):
         if isinstance(data, torch.utils.data.DataLoader):
             return self._predict_dataloader(data, prefix)
         return self._predict(data)
-    def _predict_dataloader(self, data_loader, prefix):
-        pass
+    def _predict_dataloader(self, dataloader, prefix):
+        img_paths = []
+        scores = []
+        masks = []
+        features = []
+        labels_gt = []
+        masks_gt = []
+
+        with tqdm.tqdm(dataloader, desc='Inferring...', leave=False) as data_iterator:
+            for data in data_iterator:
+                if isinstance(data, dict):
+                    labels_gt.extend(data['is_anomaly'].numpy().tolist())
+                    if data.get('mask', None) is not None:
+                        masks_gt.extend(data['mask'].numpy().tolist())
+                    image = data['image']
+                    img_paths.extend(data['image_path'])
+                _scores, _masks, _feats = self._predict(image)
+                for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data['is_anomaly'].numpy().tolist()):
+                    scores.append(score)
+                    masks.append(mask)
+        return scores, masks, features, labels_gt, masks_gt
+    def _predict(self, images):
+        images = images.to(torch.float).to(self.device)
+        _ = self.forward_modules.eval()
+
+        batch_size = images.shape[0]
+        if self.pre_proj > 0:
+            self.pre_proj.eval()
+        self.discriminator.eval()
+        with torch.no_grad():
+            features, patch_shapes = self._embed(images, evaluation = True,
+                                                provide_patch_shapes = True)
+            if self.pre_proj > 0:
+                features = self.pre_projection(features)
+            
+            patch_scores = image_scores = -self.disciminator(features)
+            patch_scores = patch_scores.cpu().numpy()
+            image_scores = image_scores.cpu().numpy()
+
+            image_scores = self.patch_maker.unpatch_scores(
+                image_scores, batchsize=batch_size
+            )
+            image_scores = image_scores.reshape(*image_scores.shape[:2], -1)
+            image_scores = self.patch_maker.score(image_scores)
+
+            patch_scores = self.patch_maker.unpatch_scores(
+                patch_scores, batchsize=batch_size
+            )
+            scales = patch_shapes[0]
+            patch_scores = patch_scores.reshape(
+                batch_size, scales[0], scales[1], -1
+            )
+            scales = patch_shapes[0]
+            patch_scores = patch_scores.reshape(batch_size, scales[0], scales[1])
+            features = features.reshape(batch_size, scales[0], scales[1], -1)
+            masks, features = self.anomaly_segmentor.convert_to_segmentation(
+                patch_scores, features
+            )
+        return list(image_scores), list(masks), list(features)
+
+    @staticmethod
+    def _params_file(filepath, prepend = ''):
+        return os.path.join(
+            filepath, prepend + 'params.pkl'
+        )
+
+    def save_to_path(self, save_path: str, prepend: str = ''):
+        LOGGER.info(f'Saving model to {save_path}...')
+        self.anomaly_scores.save(
+            save_path, save_features_separately = False, prepend = prepend
+        )
+        params = {
+            'backbone': self.backbone,
+            'layers_to_extract_from': self.layers_to_extract_from,
+            'input_shape': self.input_shape,
+            'pretrain_embed_dimension': self.forward_modules['preprocessing'].output_dim,
+            'target_embed_dimension': self.forward_modules['preadapt_aggretor'].target_dim,
+            'patchsize': self.patch_maker.patchsize,
+            'patchstride': self.patch_maker.stride,
+            'anomaly_scorer_num_nn': self.anomaly_scores.n_nearest_neighbours,
+        }
+        with open(self._params_file(save_path, prepend), 'wb') as f:
+            pickle.dump(params, f, pickle.HIGHEST_PROTOCOL)
+
+class PatchMaker:
+    def __init__(self, patchsize, top_k = 0, stride = None):
+        self.patchsize = patchsize
+        self.top_k = top_k
+        self.stride = stride
+    
+    def patchify(self, features, return_spatial_info=False):
+        padding = int((self.patchsize - 1) / 2)
+        unfolder = torch.nn.Unfold(
+            kernel_size=self.patchsize, stride=self.stride, padding=padding, dilation=1
+        )
+        unfolded_features = unfolder(features)
+        number_of_total_patches = []
+        for s in features.shapes[-2:]:
+            n_patches = (
+                s + 2 * padding - 1 * (self.patchsize - 1) - 1
+            ) / self.stride + 1
+            number_of_total_patches.append(int(n_patches))
+        unfolded_features = unfolded_features.reshape(
+            *features.shape[:2], self.patchsize, self.patchsize, -1
+        )
+        unfolded_features = unfolded_features.permute(0, 4, 1, 2, 3)
+        if return_spatial_info:
+            return unfolded_features, number_of_total_patches
+        return unfolded_features
+    
+    def unpatch_scores(self, x, batchsize):
+        return x.reshape(batchsize, - 1, *x.shape[1:])
+    
+    def score(self, x):
+        was_numpy = False
+        if isinstance(x, np.ndarray):
+            was_numpy = True
+            x = torch.from_numpy(x)
+        while x.ndim > 2:
+            x = x.max(x, dim = -1).values
+        if x.ndim == 2:
+            if self.top_k > 1:
+                x = torch.topk(x, self.top_k, dim = 1).values.mean()
+            else:
+                x = torch.max(x, dim = 1).values
+        if was_numpy:
+            return x.numpy()
+        return x
+        
